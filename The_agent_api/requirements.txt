@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pyulog
+pandas>=1.5.0
+numpy>=1.24.0
+sentence-transformers>=2.2.2
+scikit-learn>=1.2.0
+python-dotenv
+torch # or tensorflow
+# Add nltk if needed by dynamic parameter tool's keyword extraction
+# nltk 
