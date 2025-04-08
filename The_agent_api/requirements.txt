@@ -8,5 +8,6 @@ sentence-transformers>=2.2.2
 scikit-learn>=1.2.0
 python-dotenv
 torch # or tensorflow
+pyarrow # Added for Parquet support
 # Add nltk if needed by dynamic parameter tool's keyword extraction
 # nltk 

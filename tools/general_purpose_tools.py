@@ -31,6 +31,16 @@ from typing import List, Dict, Any, Union, Optional
 import ast
 from pathlib import Path
 import re
+import builtins
+import io         # Added for capturing stdout
+import contextlib # Added for redirect_stdout
+import math
+import time
+import traceback
+import datetime # <-- ADDED IMPORT
+from contextlib import redirect_stdout, redirect_stderr
+import uuid # Added for unique filenames
+import base64 # <-- ADDED IMPORT
 
 # Add color constants for console output
 try:
@@ -42,11 +52,41 @@ except ImportError:
     GREEN = "\033[92m"
     RESET = "\033[0m"
 
+# Add Import for SessionContext
+# Assuming session.py is accessible via the adjusted sys.path in main.py
+# This might need adjustment based on how tools are imported/run
+try:
+    from The_agent_api.api.session import SessionContext
+except ImportError:
+    # Fallback or error handling if SessionContext can't be imported directly
+    # This indicates a potential issue with how the environment/PYTHONPATH is set up
+    # when this tool module is loaded.
+    print("WARNING: Could not import SessionContext. 'run_computation' might fail.")
+    SessionContext = None # Define as None to avoid NameError, but tool will likely fail
+
 # Default directory for CSV topic files
 DEFAULT_CSV_DIR = "csv_topics"
 
 # Cache to store topic to file path mappings
 _TOPIC_FILE_CACHE = {}
+
+# --- Attempt to import plotting libraries --- 
+# These are optional for the compute tool but needed for plotting
+_MATPLOTLIB_AVAILABLE = False
+_SEABORN_AVAILABLE = False
+try:
+    import matplotlib
+    matplotlib.use('Agg') # Use non-interactive backend suitable for servers
+    import matplotlib.pyplot as plt
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    print("WARNING: matplotlib not found. Plotting tool will not work.")
+try:
+    import seaborn as sns
+    _SEABORN_AVAILABLE = True
+except ImportError:
+    print("WARNING: seaborn not found. Some plotting styles may not work.")
+# --- End Plotting Imports --- 
 
 def get_topic_fields(topic_name: str, csv_dir: str = DEFAULT_CSV_DIR, file_path: str = None) -> Dict[str, Any]:
     """
@@ -255,298 +295,109 @@ def get_data(topic_name: str, fields: Optional[List[str]] = None,
             "error": f"Error getting data for topic '{topic_name}': {str(e)}"
         }
 
-def run_computation(data: Union[Dict[str, Any], pd.DataFrame, str] = None, 
-                   computation: str = None,
-                   comment: str = None,
-                   data_id: str = None,
-                   data_cache: Dict[str, Any] = None) -> Dict[str, Any]:
+def run_computation(session: SessionContext, 
+                    data_ids: Optional[List[str]], # Changed from data_id
+                    computation: str,
+                    comment: Optional[str] = None) -> Dict[str, Any]:
     """
-    Run arbitrary computation on data.
+    Executes a Python computation string. If data_ids are provided, loads the cached 
+    DataFrames into variables named 'df1', 'df2', etc. Otherwise, runs the code directly.
     
     Args:
-        data: Either the complete data object returned from get_data()
-              or custom data that can be converted to a DataFrame
-        computation: A valid Python expression operating on a DataFrame 'df'
-        comment: A brief explanation of what this computation is doing (optional)
-        data_id: ID of the data to retrieve from cache (alternative to data parameter)
-        data_cache: External data cache to use (passed from calling module)
+        session: The SessionContext object.
+        data_ids: List of IDs of cached DataFrames to load (e.g., [id1, id2]). If None/empty, no DataFrames are loaded.
+        computation: The Python code string to execute.
+        comment: Optional comment about the computation.
         
     Returns:
-        Dictionary with computation results or error
+        Dictionary with success status, result summary (stdout/stderr), and error message.
     """
+    print(f"run_computation: Received request with data_ids='{data_ids}', computation='{computation}'")
+    
+    # Define a restricted global scope with allowed modules
+    allowed_globals = {
+        '__builtins__': __builtins__, # Allow standard built-ins
+        'pd': pd,              # Allow pandas
+        'np': np,              # Allow numpy
+        'math': math,            # Allow math
+        'datetime': datetime,      # Allow datetime
+        # Add other safe modules as needed
+        # df variables will be added dynamically below
+    }
+
+    # Load DataFrames if data_ids are provided
+    if data_ids: 
+        print(f"run_computation: Attempting to load DataFrames for data_ids {data_ids} from session '{session.session_id}'")
+        loaded_dfs = {}
+        for i, data_id in enumerate(data_ids):
+            df_var_name = f"df{i+1}" # Create names df1, df2, ...
+            df = session.get_from_cache(data_id) 
+            
+            if df is None:
+                error_msg = f"Data ID '{data_id}' (index {i}, requested as {df_var_name}) not found or failed to load in session '{session.session_id}'. Cache data first."
+                print(f"run_computation: Failed loading: {error_msg}")
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "result_summary": None
+                }
+            else:
+                print(f"run_computation: Loaded DataFrame for '{data_id}' into '{df_var_name}' with shape {df.shape}")
+                # Make the loaded DataFrame available in the execution scope
+                allowed_globals[df_var_name] = df
+                loaded_dfs[df_var_name] = df # Keep track for potential future use/inspection
+        
+        if not loaded_dfs: # Should not happen if loop ran unless data_ids was empty but not None
+             print("run_computation: data_ids provided but no DataFrames were loaded successfully.")
+             # This case might indicate an issue, but proceed to execution for now?
+             # Or return error? Let's return error for clarity.
+             return {
+                    "success": False,
+                    "error": "data_ids provided, but failed to load any DataFrames.",
+                    "result_summary": None
+                }   
+    else:
+        print("run_computation: No data_ids provided, executing general Python code.")
+
+    # Capture stdout and stderr
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    
+    start_time = time.time() # Track execution time
+    success = False
+    error_message = None
+    
     try:
-        # Check parameters
-        if not computation:
-            return {
-                "success": False,
-                "error": "Computation expression is required but was not provided."
-            }
-            
-        df = None
-        data_source = "direct"
-        
-        # Prioritize data_id if provided
-        if data_id:
-            # The data should already be loaded by the calling module
-            # and passed in the data parameter
-            data_source = "data_id"
-            print(f"Using data with ID: {data_id} for computation")
-            
-            # Data should already be loaded and passed in the data parameter
-            if data is not None:
-                if isinstance(data, dict) and '_dataframe' in data:
-                    df = data['_dataframe']
-                elif isinstance(data, pd.DataFrame):
-                    df = data
-                else:
-                    return {
-                        "success": False,
-                        "error": f"Data format for ID {data_id} is not supported. Expected DataFrame or dict with _dataframe."
-                    }
-            else:
-                return {
-                    "success": False,
-                    "error": f"No data provided for ID {data_id}. Data must be loaded before calling run_computation."
-                }
-        # Check for function reference pattern - this is a common pattern where models
-        # attempt to reference a previous function call rather than using the data directly
-        elif isinstance(data, dict) and 'function_name' in data and 'args' in data:
-            data_source = "function_reference"
-            # We've received a function reference - execute the referenced function to get data
-            try:
-                print(f"Detected function reference pattern. Executing referenced function: {data['function_name']}")
-                
-                if data['function_name'] == 'topic_data' or data['function_name'] == 'get_data':
-                    # Extract arguments from the reference
-                    topic_name = None
-                    fields = None
-                    
-                    # Process args which might be in different formats
-                    if isinstance(data['args'], list):
-                        for arg in data['args']:
-                            if isinstance(arg, dict):
-                                if 'topic_name' in arg:
-                                    topic_name = arg['topic_name']
-                                if 'fields' in arg:
-                                    fields = arg['fields']
-                    elif isinstance(data['args'], dict):
-                        topic_name = data['args'].get('topic_name')
-                        fields = data['args'].get('fields')
-                    
-                    if topic_name:
-                        # Execute topic_data/get_data to get the actual data
-                        result = get_data(topic_name, fields)
-                        if result.get('success', False) and '_dataframe' in result:
-                            df = result['_dataframe']
-                            print(f"Successfully retrieved data for topic '{topic_name}' with fields {fields}")
-                        else:
-                            return {
-                                "success": False,
-                                "error": f"Error retrieving data for topic '{topic_name}': {result.get('error', 'Unknown error')}"
-                            }
-                    else:
-                        return {
-                            "success": False,
-                            "error": "Missing topic_name in function reference"
-                        }
-                else:
-                    return {
-                        "success": False,
-                        "error": f"Unsupported function reference: {data['function_name']}"
-                    }
-            except Exception as e:
-                return {
-                    "success": False,
-                    "error": f"Error executing referenced function: {str(e)}"
-                }
-        # Handle direct data input
-        elif data is not None:
-            data_source = "direct"
-            # Case 1: Direct data object from get_data() - extract the _dataframe field
-            if isinstance(data, dict) and '_dataframe' in data:
-                df = data['_dataframe']
-            
-            # Case 2: Custom data from the agent (various formats)
-            elif isinstance(data, dict):
-                # Handle various dictionary formats that can be converted to DataFrame
-                if 'data' in data and isinstance(data['data'], list):
-                    if 'columns' in data and isinstance(data['columns'], list):
-                        df = pd.DataFrame(data['data'], columns=data['columns'])
-                    else:
-                        df = pd.DataFrame(data['data'])
-                else:
-                    # Try to create DataFrame directly from the dictionary
-                    df = pd.DataFrame(data)
-            
-            # Case 3: Already a DataFrame
-            elif isinstance(data, pd.DataFrame):
-                df = data
-            else:
-                return {
-                    "success": False,
-                    "error": f"Provided data is in an unsupported format: {type(data)}"
-                }
-        else:
-            return {
-                "success": False,
-                "error": "No data or data_id provided. You must provide either data or data_id."
-            }
-            
-        # Check if we have valid data to work with
-        if df is None:
-            return {
-                "success": False,
-                "error": "Could not extract a valid DataFrame from the provided data."
-            }
-        
-        # Normalize the DataFrame to ensure it's properly structured
-        if df.empty:
-            return {
-                "success": False,
-                "error": "The DataFrame is empty. There is no data to compute on."
-            }
-            
-        # Handle single-column DataFrame in a way that prevents 'must pass index' errors
-        if len(df.columns) == 1:
-            # If there's only one column and computation refers to it by name,
-            # convert to Series access pattern to avoid index errors
-            col_name = df.columns[0]
-            
-            # Check if computation attempts to access column by name
-            if f'df["{col_name}"]' in computation or f"df['{col_name}']" in computation:
-                # Create a special computation environment with the Series
-                series = df[col_name]
-                namespace = {"series": series, "pd": pd, "np": np}
-                
-                # Modify computation to use series directly
-                modified_comp = computation.replace(f'df["{col_name}"]', 'series')
-                modified_comp = modified_comp.replace(f"df['{col_name}']", 'series')
-                
-                try:
-                    result = eval(modified_comp, namespace)
-                    return {
-                        "success": True,
-                        "computation": "Computation performed successfully",
-                        "result": result,
-                        "data_source": data_source,
-                        "note": "Used Series access for single-column DataFrame"
-                    }
-                except Exception:
-                    # If modified computation fails, fall back to standard approach
-                    pass
-        
-        # Reset index to ensure proper structure regardless of original format
-        df = df.reset_index(drop=True)
-        
-        # Verify column names
-        if any(not isinstance(col, str) for col in df.columns):
-            # Convert all column names to strings for consistent access
-            df.columns = [str(col) for col in df.columns]
-            
-        # Execute the computation in a safe environment with the normalized DataFrame
-        namespace = {"df": df, "pd": pd, "np": np}
-        
-        try:
-            # Detect if the computation is multi-line (needs exec instead of eval)
-            is_multiline = '\n' in computation.strip()
-            
-            # Special case for quaternion to Euler conversion (common in flight logs)
-            if "quaternion_to_euler" in computation or ("quaternion" in computation and "euler" in computation):
-                print(f"{GREEN}Detected quaternion to Euler conversion. Using specialized handling...{RESET}")
-                # Add quaternion_to_euler function to namespace
-                namespace["quaternion_to_euler"] = lambda q: (
-                    np.degrees(np.arctan2(2.0 * (q[0] * q[1] + q[2] * q[3]), 1.0 - 2.0 * (q[1]**2 + q[2]**2))),  # roll
-                    np.degrees(np.arcsin(2.0 * (q[0] * q[2] - q[3] * q[1]))),  # pitch
-                    np.degrees(np.arctan2(2.0 * (q[0] * q[3] + q[1] * q[2]), 1.0 - 2.0 * (q[2]**2 + q[3]**2)))   # yaw
-                )
-                
-                # If this is a multi-line computation with quaternion conversion, make sure it works
-                if is_multiline:
-                    # Ensure the computation has access to the quaternion_to_euler function
-                    computation = "from numpy import degrees, arctan2, arcsin\n" + computation
-            
-            if is_multiline:
-                # For multi-line code, we need to use exec and capture output
-                # Create a StringIO object to capture print statements
-                import sys
-                from io import StringIO
-                
-                # Create a variable to store the result
-                namespace['_result'] = None
-                old_stdout = sys.stdout
-                
-                try:
-                    # Redirect stdout to capture prints
-                    sys.stdout = mystdout = StringIO()
-                    
-                    # Add the code to store the last expression's result in _result
-                    # We'll wrap the user's code in a try-except block
-                    wrapped_code = "try:\n"
-                    
-                    # Indent each line of the original code
-                    for line in computation.split('\n'):
-                        wrapped_code += "    " + line + "\n"
-                    
-                    # If needed, capture result
-                    wrapped_code += "except Exception as e:\n"
-                    wrapped_code += "    print(f'Error in computation: {str(e)}')\n"
-                    
-                    # Execute the wrapped code
-                    exec(wrapped_code, namespace)
-                    
-                    # Get printed output
-                    printed_output = mystdout.getvalue()
-                    
-                    # If there's explicit output from print statements, use that
-                    if printed_output.strip():
-                        result = printed_output.strip()
-                    # Otherwise try to get the stored _result
-                    elif '_result' in namespace and namespace['_result'] is not None:
-                        result = namespace['_result']
-                    else:
-                        # If no explicit output, the "result" is that the code executed successfully
-                        result = "Computation executed successfully (no explicit output)"
-                        
-                    return {
-                        "success": True,
-                        "computation": "Computation performed successfully",
-                        "result": result,
-                        "data_source": data_source,
-                        "execution_method": "exec (multi-line code)"
-                    }
-                finally:
-                    # Restore stdout
-                    sys.stdout = old_stdout
-            else:
-                # For simple one-line expressions, use eval
-                result = eval(computation, namespace)
-                
-                # Prepare the result
-                response = {
-                    "success": True,
-                    "computation": "Computation performed successfully",
-                    "result": result,
-                    "data_source": data_source,
-                    "execution_method": "eval (single-line expression)"
-                }
-                
-                # Add the comment if provided
-                if comment:
-                    response["comment"] = comment
-                    
-                return response
-                
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error executing computation '{computation}': {str(e)}"
-            }
-            
+        # Execute the computation string within the restricted scope
+        print(f"Executing computation: {computation}")
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            exec(computation, allowed_globals)
+        success = True
+        print("Computation execution finished. Output source: stdout")
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"Error processing data for computation: {str(e)}"
-        }
+        print(f"Computation execution error: {e}")
+        error_message = f"Computation execution error: {traceback.format_exc()}"
+        success = False
+        print("Computation execution finished. Output source: stderr")
+    
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Computation execution time: {execution_time:.4f} seconds")
+
+    # Get the captured output
+    stdout_result = stdout_capture.getvalue()
+    stderr_result = stderr_capture.getvalue()
+    
+    # Combine stdout and stderr for summary, prioritize stderr if error occurred
+    result_summary = f"stdout:\n{stdout_result}\nstderr:\n{stderr_result}" if not error_message else f"stderr:\n{stderr_result}\nstdout:\n{stdout_result}"
+    
+    # Return results
+    return {
+        "success": success,
+        "result_summary": result_summary.strip(),
+        "error": error_message,
+        "execution_time_seconds": execution_time
+    }
 
 def update_topic_file_cache(topic_name: str, file_path: str):
     """
@@ -663,6 +514,134 @@ def extract_file_paths_from_dp_results(dp_results: List[Dict[str, Any]]) -> Dict
                 paths[topic_name] = file_path
     
     return paths
+
+# --- NEW Plotting Tool Function ---
+def run_plotting(session: 'SessionContext', 
+                 data_ids: Optional[List[str]], 
+                 code: str,
+                 comment: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Executes Python code to generate a plot, save it temporarily, read it, 
+    and return the Base64 encoded content.
+    
+    Args:
+        session: The SessionContext object.
+        data_ids: List of IDs of cached DataFrames (loaded as df1, df2, ...).
+        code: Python code to execute. MUST generate a plot and call plt.savefig(save_path).
+        comment: Optional comment.
+        
+    Returns:
+        Dictionary with success status, plot filename, base64 content, error message, and execution summary.
+    """
+    print(f"run_plotting: Received request with data_ids='{data_ids}', comment='{comment}'")
+
+    if not _MATPLOTLIB_AVAILABLE:
+        return {"success": False, "error": "matplotlib is not installed on the server. Plotting is disabled."}
+
+    plots_dir = session.session_dir / "plots"
+    try:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"success": False, "error": f"Failed to create plots directory '{plots_dir}': {e}"}
+
+    plot_filename = f"plot_{uuid.uuid4()}.png"
+    save_path = plots_dir / plot_filename
+
+    allowed_globals = {
+        '__builtins__': __builtins__,
+        'pd': pd,
+        'np': np,
+        'math': math,
+        'datetime': datetime,
+        'plt': plt if _MATPLOTLIB_AVAILABLE else None,
+        'sns': sns if _SEABORN_AVAILABLE else None,
+        'save_path': str(save_path),
+        # df variables added below
+    }
+
+    if data_ids: 
+        print(f"run_plotting: Loading DataFrames for {data_ids}")
+        for i, data_id in enumerate(data_ids):
+            df_var_name = f"df{i+1}"
+            df = session.get_from_cache(data_id) 
+            if df is None:
+                error_msg = f"Data ID '{data_id}' (index {i}, as {df_var_name}) not found or failed to load."
+                print(f"run_plotting: Failed loading: {error_msg}")
+                return {"success": False, "error": error_msg}
+            else:
+                print(f"run_plotting: Loaded '{df_var_name}' (shape {df.shape})")
+                allowed_globals[df_var_name] = df
+    else:
+        print("run_plotting: No data_ids provided, executing general plotting code.")
+
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    start_time = time.time()
+    success = False
+    error_message = None
+    plot_content_base64 = None
+    
+    plt.close('all') 
+
+    try:
+        print(f"Executing plotting code... Target path: {save_path}")
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            exec(code, allowed_globals)
+        
+        if not save_path.is_file():
+             error_message = "Plot execution finished, but the expected plot file was not saved. Did you forget to call `plt.savefig(save_path)` in your code?"
+             print(f"run_plotting: Error - {error_message}")
+             success = False
+        else:
+             print(f"Plot successfully saved locally to: {save_path}. Reading and encoding...")
+             try:
+                 with open(save_path, "rb") as image_file:
+                     plot_content_base64 = base64.b64encode(image_file.read()).decode('utf-8')
+                 print(f"Successfully encoded plot content.")
+                 success = True
+             except Exception as read_error:
+                 error_message = f"Plot file created, but failed to read or encode it: {read_error}"
+                 print(f"run_plotting: Error - {error_message}")
+                 success = False
+
+    except Exception as e:
+        print(f"Plotting code execution error: {e}")
+        error_message = f"Plotting code execution error: {traceback.format_exc()}"
+        success = False
+        if save_path.exists():
+             try: save_path.unlink()
+             except OSError: pass
+
+    finally:
+         # Ensure matplotlib figures are closed after execution to free memory
+         plt.close('all') 
+         # --- REMOVED Cleanup of local file ---
+         # # Optionally delete local file after encoding/failure? 
+         # # Decide if we keep the local plot file for debugging or clean it up.
+         # # Let's clean it up for now to avoid filling temp storage.
+         # if save_path.exists():
+         #      try: 
+         #          save_path.unlink()
+         #          print(f"Cleaned up local plot file: {save_path}")
+         #      except OSError as del_err:
+         #          print(f"Warning: Failed to clean up local plot file {save_path}: {del_err}")
+         # --- End REMOVED Cleanup --- 
+         
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Plotting execution time: {execution_time:.4f} seconds")
+    stdout_result = stdout_capture.getvalue()
+    stderr_result = stderr_capture.getvalue()
+    result_summary = f"stdout:\n{stdout_result}\nstderr:\n{stderr_result}".strip()
+    
+    return {
+        "success": success,
+        "plot_filename": plot_filename if success else None,
+        "plot_content_base64": plot_content_base64 if success else None,
+        "result_summary": result_summary,
+        "error": error_message,
+        "execution_time_seconds": execution_time
+    }
 
 if __name__ == "__main__":
     # Example usage

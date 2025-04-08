@@ -29,7 +29,7 @@ try:
     # Import tool classes (adjust paths/names as needed based on actual files)
     from tools.extract_dynamic_param_tool import DynamicParameterTool
     from tools.extract_static_param_tool import StaticParameterTool
-    from tools.general_purpose_tools import get_topic_fields, get_data, run_computation
+    from tools.general_purpose_tools import get_topic_fields, get_data, run_computation, run_plotting
 except ImportError as e:
     print(f"Error importing project modules: {e}")
     print("Ensure the script is run from the correct directory or PYTHONPATH is set.")
@@ -157,11 +157,32 @@ async def upload_ulog_for_session(
     session_id: str = FastApiPath(..., description="The client-provided session ID (e.g., chat ID)."),
     file: UploadFile = File(..., description="The .ulg flight log file to upload.")
 ):
-    """Handles ULog file upload for a specific session, converting and preparing it."""
+    """Handles ULog file upload for a specific session, converting and preparing it.
+    Checks if the session already has processed CSV data and skips reprocessing if found.
+    """
     if not file.filename.lower().endswith('.ulg'):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a .ulg file.")
 
-    # Get or create session with the provided ID. This also resets if it exists.
+    # --- Check if session exists and has already been processed ---
+    existing_session = session_manager.get_session(session_id)
+    if existing_session:
+        # Check if the CSV directory exists and contains CSV files
+        try:
+            if existing_session.csv_dir.exists() and any(existing_session.csv_dir.glob('*.csv')):
+                print(f"Session {session_id} already has processed CSV data. Skipping upload.")
+                # Close the uploaded file handle as we are not using it
+                if file and hasattr(file, 'file') and not file.file.closed:
+                     await file.close()
+                return models.UploadResponse(
+                    session_id=session_id,
+                    message=f"Session {session_id} data already processed. Upload skipped."
+                )
+        except Exception as check_err:
+            # Log the error but proceed as if data doesn't exist, allowing reprocessing
+            print(f"Error checking existing session {session_id} data, proceeding with upload: {check_err}")
+    # --- End check ---
+
+    # If session doesn't exist, or exists but has no CSV data, proceed with get_or_create (which resets if needed)
     session = session_manager.get_or_create_session(session_id)
 
     # Define paths for this session
@@ -178,39 +199,60 @@ async def upload_ulog_for_session(
         # Store the path to the original ulog file in the session context
         session.set_ulog_path(temp_ulog_path)
 
-        # --- Call new helper for conversion AND renaming ---
-        print(f"Starting conversion and renaming: {temp_ulog_path} -> {csv_output_dir}")
-        processing_success = await asyncio.to_thread(
-            _convert_and_rename_ulog_csvs, # Call the new wrapper function
-            ulog_filepath_str=str(temp_ulog_path),
-            csv_output_dir_str=str(csv_output_dir),
-            ulog_original_filename=file.filename # Pass original filename for prefix calculation
+        # --- Conversion and Renaming ---
+        print(f"Starting ULog to CSV conversion for {file.filename}...")
+        conversion_success = await asyncio.to_thread(
+            _convert_and_rename_ulog_csvs,
+            str(temp_ulog_path),          # Pass ulog path as string
+            str(csv_output_dir),          # Pass csv output dir as string
+            file.filename                 # Pass original filename
         )
-        # --- End change ---
+        # --- End Conversion ---
 
-        if not processing_success: # Check the result of the wrapper
-            raise HTTPException(status_code=500, detail="ULog to CSV conversion failed. Check server logs.")
+        if not conversion_success:
+            print(f"Conversion failed for {file.filename}. Session {session_id} might be incomplete.")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to convert ULog file '{file.filename}' to CSV format."
+            )
+        else:
+            print(f"Conversion successful for {file.filename}. CSVs in {csv_output_dir}")
+            # Create the success marker file AFTER successful conversion
+            marker_filename = "_SUCCESS" # Consistent marker file name
+            marker_file_path = session.session_dir / marker_filename
+            try:
+                marker_file_path.touch() # Create an empty _SUCCESS file
+                print(f"Created success marker file: {marker_file_path}")
+            except Exception as marker_err:
+                print(f"Warning: Could not create success marker file {marker_file_path}: {marker_err}")
 
-        print(f"Processing successful for session {session.session_id}")
+
         return models.UploadResponse(
-            session_id=session.session_id, # Return the session_id used/created
-            message=f"File '{file.filename}' uploaded and processed successfully for session {session.session_id}."
+            session_id=session.session_id,
+            message=f"Successfully uploaded and processed '{file.filename}'. CSV data ready."
         )
 
+    except HTTPException as http_exc:
+        # Re-raise HTTPExceptions directly
+        raise http_exc
     except Exception as e:
-        # Log error but don't necessarily delete session on generic error
-        print(f"Error during upload for session {session.session_id}: {e}")
+        # Log the error and return a 500 response for other errors
+        print(f"Error during upload/processing for session {session_id}: {e}")
+        # Clean up potentially partially saved file? Depends on desired atomicity.
+        # if temp_ulog_path.exists():
+        #     temp_ulog_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
     finally:
-        # Ensure the uploaded file object is closed
+        # Ensure the uploaded file handle is closed even if errors occur
         if file and hasattr(file, 'file') and not file.file.closed:
              await file.close()
 
 @app.delete("/session/{session_id}",
-            summary="End Session",
-            description="End an analysis session and delete its temporary data.")
-async def end_session(
-    session_id: str = FastApiPath(..., description="The ID of the session to end.")
+            response_model=models.DeleteResponse,
+            summary="Delete Session Data",
+            description="Deletes all temporary data (ULog, CSVs, cache) associated with a session ID.")
+async def delete_session(
+    session_id: str = FastApiPath(..., description="The ID of the session to delete.")
 ):
     """Ends a session and cleans up its resources."""
     session = session_manager.get_session(session_id)
@@ -234,6 +276,7 @@ async def dynamic_search(
 ):
     """Performs semantic search over dynamic ULog topics using the DynamicParameterTool."""
     print(f"--- API: ENTERING dynamic_search endpoint for session {session.session_id} ---") # <-- DIAGNOSTIC
+    print(f"DEBUG: dynamic_search using session '{session.session_id}', csv_dir: '{session.csv_dir}'") # <-- ADDED DEBUG
     # print(f"Received dynamic search for session {session.session_id}: '{request.query}'") # Keep original print commented for now
     
     csv_dir = str(session.csv_dir)
@@ -286,6 +329,7 @@ async def static_search(
 ):
     """Performs semantic search over static parameters using the StaticParameterTool."""
     print(f"Received static search for session {session.session_id}: '{request.query}'")
+    print(f"DEBUG: static_search using session '{session.session_id}', ulog_path: '{session.ulog_path}'") # <-- ADDED DEBUG
 
     static_csv_path = str(config.STATIC_PARAMS_CSV_PATH)
     ulog_file_path = str(session.ulog_path) if session.ulog_path else None
@@ -329,6 +373,7 @@ async def topic_fields(
 ):
     """Lists the fields (columns) available in a specific topic CSV file."""
     print(f"Received topic fields request for session {session.session_id}")
+    print(f"DEBUG: topic_fields using session '{session.session_id}', csv_dir: '{session.csv_dir}'") # <-- ADDED DEBUG
 
     csv_dir = str(session.csv_dir)
     topic_name = request.topic_name
@@ -393,6 +438,7 @@ async def topic_data(
 ):
     """Retrieves data for specified fields from a topic CSV and caches the DataFrame."""
     print(f"Received topic data request for session {session.session_id}")
+    print(f"DEBUG: topic_data using session '{session.session_id}', csv_dir: '{session.csv_dir}'") # <-- ADDED DEBUG
 
     csv_dir = str(session.csv_dir)
     topic_name = request.topic_name
@@ -456,64 +502,63 @@ async def topic_data(
         print(f"Error during topic_data execution for session {session.session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
-@app.post("/tools/compute/{session_id}", 
+@app.post("/tools/compute/{session_id}",
             response_model=models.ComputeResponse,
-            summary="Run Computation on Cached Data")
-async def compute(
+            summary="Run Computation on Cached Data",
+            description="Executes a Python computation string on previously cached data using its data_id.")
+async def run_computation_endpoint(
     request: models.ComputeRequest,
     session: SessionContext = Depends(get_valid_session)
 ):
-    """Executes Python code, optionally against a cached DataFrame."""
-    print(f"Received compute request for session {session.session_id} (data_id: {request.data_id or 'NONE'})") # Updated log
-    code_to_run = request.code
-    comment = request.comment
-    dataframe = None # Initialize DataFrame to None
-    data_id_used = request.data_id
+    """Endpoint to execute computations using the run_computation tool."""
+    print(f"DEBUG: run_computation_endpoint using session '{session.session_id}', cache_dir: '{session.cache_dir}'") # <-- ADDED DEBUG
+    # --- Use data_ids list from request --- 
+    data_ids_to_use = request.data_ids # This is now Optional[List[str]]
 
-    # --- SECURITY CHECK --- (Keep removed as per previous request)
-
-    # --- Retrieve Cached Data (ONLY if data_id is provided) ---
-    if request.data_id:
-        # Specific data_id provided
-        print(f"Attempting to retrieve specific DataFrame: {request.data_id}")
-        dataframe = session_manager.get_cached_data(session.session_id, request.data_id)
-        if dataframe is None:
-            raise HTTPException(status_code=404, detail=f"Specified Data ID '{request.data_id}' not found in cache for session {session.session_id}.")
-        print(f"Retrieved DataFrame {data_id_used} for computation (shape: {dataframe.shape})")
+    # Remove the logic for automatically using the most recent cache item.
+    # If data_ids_to_use is None or empty, it signifies general execution.
+    if not data_ids_to_use: 
+         print("No data_ids provided. Proceeding with general Python execution.")
+         data_ids_to_use = None # Ensure it's None if empty list was passed
     else:
-        # No data_id provided, proceed without a pre-loaded DataFrame
-        print("No specific data_id provided. Proceeding without pre-loading 'df'.")
-        data_id_used = None # Ensure this is None if not provided
+        print(f"Received data_ids: {data_ids_to_use}")
 
+    # --- Execute Computation --- 
+    # Pass the list of data IDs (or None) to the tool.
+    print(f"Calling run_computation tool for session {session.session_id} with data_ids {data_ids_to_use}")
     try:
-        # --- Execute Computation --- 
-        # Pass the retrieved DataFrame (which might be None) to the tool
-        print(f"WARNING: Executing potentially unsafe code for session {session.session_id} without sandboxing!")
-        computation_result = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_computation,
-            data=dataframe, # Pass DataFrame OR None
-            computation=code_to_run,
-            comment=comment,
+            session=session, # Pass the SessionContext object
+            data_ids=data_ids_to_use, # Pass the list of data_ids (or None)
+            computation=request.code,
+            comment=request.comment
         )
-        
-        # --- Process Result --- 
-        print(f"Computation executed for session {session.session_id} (data_id used: {data_id_used})") # Use actual id used
-        # ... (rest of result processing logic remains the same) ...
-        if isinstance(computation_result, dict):
-            success = computation_result.get("success", False)
-            result_summary = computation_result.get("result", computation_result.get("preview"))
-            error_msg = computation_result.get("error")
-            if not success:
-                print(f"Computation failed for session {session.session_id}, data {data_id_used}: {error_msg}")
-                return models.ComputeResponse(success=False, error=error_msg or "Computation tool reported failure.", result_summary=None)
-            else:
-                return models.ComputeResponse(success=True, error=None, result_summary=result_summary)
-        else:
-            return models.ComputeResponse(success=True, error=None, result_summary=computation_result)
+    except Exception as tool_exec_err:
+        # Catch errors originating from the tool function execution itself
+        print(f"Error executing run_computation tool via asyncio.to_thread: {tool_exec_err}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error executing computation tool: {tool_exec_err}"
+        )
+    # --- End Execution ---
 
-    except Exception as e:
-        print(f"Error during compute execution for session {session.session_id} (data_id used: {data_id_used}): {e}") # Use actual id used
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during computation: {e}")
+    if not result or not result.get("success"):
+        error_detail = result.get("error", "Computation tool failed.") if result else "Computation tool failed."
+        # Check if it was a user code error or tool error
+        status_code = 400 if "Computation execution error" in error_detail else 500
+        raise HTTPException(
+            status_code=status_code, 
+            detail=error_detail
+        )
+
+    # Return the summary from the computation result
+    # Ensure the response model matches the actual structure returned by the tool
+    return models.ComputeResponse(
+        success=True,
+        result_summary=result.get("result_summary"),
+        error=result.get("error", None) # Include error field if tool provides one even on success (e.g., warnings)
+    )
 
 @app.get("/tools/static_param_lookup/{session_id}",
             response_model=models.StaticParamLookupResponse,
@@ -526,6 +571,7 @@ async def static_param_lookup(
 ):
     """Looks up a static parameter by its exact name."""
     print(f"Received static param lookup for session {session.session_id}, param_name='{param_name}'")
+    print(f"DEBUG: static_param_lookup using session '{session.session_id}', ulog_path: '{session.ulog_path}'") # <-- ADDED DEBUG
 
     static_csv_path = str(config.STATIC_PARAMS_CSV_PATH)
     ulog_file_path = str(session.ulog_path) if session.ulog_path else None
@@ -554,6 +600,112 @@ async def static_param_lookup(
     except Exception as e:
         print(f"Error during static param lookup for session {session.session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred during static parameter lookup: {e}")
+
+# --- NEW ENDPOINT ---
+@app.get("/check_session/{session_id}",
+           response_model=models.SessionStatusResponse, # Define this model in api/models.py
+           summary="Check Session Processing Status",
+           description="Check if the data processing for a given session ID has successfully completed.")
+async def check_session_status(
+    session_id: str = FastApiPath(..., description="The session ID to check.")
+):
+    """
+    Checks if the session directory and a success marker file exist.
+    """
+    processed = False
+    marker_filename = "_SUCCESS" # Marker file indicating successful completion
+    session_dir_path = None
+
+    try:
+        # Use config.TEMP_BASE_DIR to construct the path to the specific session directory
+        # Ensure session_id is treated as a string component
+        session_dir_path = os.path.join(config.TEMP_BASE_DIR, str(session_id))
+
+        # Construct the path to the marker file within that directory
+        marker_file_path = os.path.join(session_dir_path, marker_filename)
+
+        # Check if the session directory exists AND the marker file exists within it
+        if os.path.isdir(session_dir_path) and os.path.isfile(marker_file_path):
+            processed = True
+
+        return models.SessionStatusResponse(processed=processed)
+
+    except Exception as e:
+        print(f"Error checking session status for {session_id} at path {session_dir_path}: {e}")
+        # If any error occurs (permissions, invalid path, etc.), assume not processed
+        # Return 500 to indicate a server-side check failure
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking status for session {session_id}: {e}"
+        )
+# --- END NEW ENDPOINT ---
+
+# --- NEW Plotting Endpoint --- 
+@app.post("/tools/plot/{session_id}",
+            response_model=models.PlotResponse,
+            summary="Generate Plot from Data",
+            description="Executes Python code to generate and save a plot from cached data.")
+async def run_plot_endpoint(
+    request: models.PlotRequest,
+    session: SessionContext = Depends(get_valid_session)
+):
+    """Endpoint to generate plots using the run_plotting tool."""
+    print(f"DEBUG: run_plot_endpoint using session '{session.session_id}'")
+
+    try:
+        # Call the run_plotting function in a thread pool
+        print(f"Calling run_plotting tool for session {session.session_id} with data_ids {request.data_ids}")
+        result = await asyncio.to_thread(
+            run_plotting,
+            session=session, 
+            data_ids=request.data_ids, 
+            code=request.code,
+            comment=request.comment
+        )
+        
+        if not result or not result.get("success"):
+            error_detail = result.get("error", "Plotting tool failed.") if result else "Plotting tool failed."
+            summary = result.get("result_summary", "") # Get summary regardless of error type
+            
+            # Determine status code (keep existing logic)
+            status_code = 400 
+            if error_detail:
+                 if "matplotlib is not installed" in error_detail:
+                     status_code = 501 
+                 elif "Failed to create plots directory" in error_detail:
+                     status_code = 500 
+            
+            # Always include the summary in the detail if it exists, for better debugging
+            if summary:
+                error_detail += f"\n--- Execution Output ---\n{summary}"
+            else: # Add a note if summary was empty
+                 error_detail += "\n(No stdout/stderr captured from execution)"
+
+            raise HTTPException(
+                status_code=status_code, 
+                detail=error_detail # Now includes summary
+            )
+
+        # Return the filename and base64 content
+        return models.PlotResponse(
+            success=True,
+            plot_filename=result.get("plot_filename"),
+            plot_content_base64=result.get("plot_content_base64"),
+            result_summary=result.get("result_summary") # Include for debugging if needed
+        )
+
+    except HTTPException as http_exc:
+         raise http_exc # Re-raise existing HTTP exceptions
+    except Exception as e:
+         # Catch unexpected errors during endpoint execution/tool call
+         print(f"Error during run_plot_endpoint for session {session.session_id}: {e}")
+         import traceback
+         traceback.print_exc() # Log full traceback for server debugging
+         raise HTTPException(
+             status_code=500,
+             detail=f"An unexpected error occurred during plot generation: {e}"
+         )
+# --- END NEW Plotting Endpoint --- 
 
 # --- Optional: Run with Uvicorn (for local development) ---
 if __name__ == "__main__":

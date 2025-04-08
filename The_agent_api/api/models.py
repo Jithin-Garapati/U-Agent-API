@@ -32,8 +32,8 @@ class TopicDataResponse(BaseModel):
     message: str = "Data cached successfully."
 
 class ComputeRequest(BaseModel):
-    data_id: Optional[str] = Field(None, description="ID of the cached DataFrame (optional; uses most recent if omitted)")
-    code: str = Field(..., description="Python code string to execute. IMPORTANT: Execution is not sandboxed by default!")
+    data_ids: Optional[List[str]] = Field(None, description="List of IDs for cached DataFrames to load (e.g., [id1, id2]). If None or empty, executes general code.")
+    code: str = Field(..., description="Python code string to execute. Loaded DataFrames available as df1, df2, etc.")
     comment: Optional[str] = Field(None, description="Optional comment about the computation")
 
 # --- Generic Tool Responses --- 
@@ -59,6 +59,19 @@ class ComputeResponse(BaseToolResponse):
     result_summary: Optional[Any] = None 
     # Potentially include updated data_id if computation modifies the cache in place? 
 
+# --- NEW Plotting Models --- 
+class PlotRequest(BaseModel):
+    data_ids: Optional[List[str]] = Field(None, description="List of IDs for cached DataFrames (df1, df2, ...). If None/empty, executes general code.")
+    code: str = Field(..., 
+                      description="Python code string to generate a plot. MUST use plotting libraries (e.g., matplotlib.pyplot as plt, seaborn as sns) and save the figure using `plt.savefig(save_path)`. The target save path is provided in the `save_path` variable.")
+    comment: Optional[str] = Field(None, description="Optional comment about the plot generation")
+
+class PlotResponse(BaseToolResponse):
+    plot_filename: Optional[str] = Field(None, description="Filename of the generated plot within the session's plot directory (e.g., plot_uuid.png)")
+    plot_content_base64: Optional[str] = Field(None, description="Base64 encoded content of the plot image.")
+    result_summary: Optional[str] = Field(None, description="Captured stdout/stderr from the execution, primarily for debugging errors.")
+# --- END NEW Plotting Models --- 
+
 class StaticParamDetail(BaseModel):
     # Define fields based on what StaticParameterTool.get_param_by_name returns
     # Example fields (adjust as needed):
@@ -81,3 +94,14 @@ class StaticParamDetail(BaseModel):
 
 class StaticParamLookupResponse(BaseToolResponse): # Inherits success/error
     parameter: Optional[StaticParamDetail] = None 
+
+# --- Session Status --- 
+class SessionStatusResponse(BaseModel):
+    """Response model for checking session status."""
+    processed: bool
+
+# --- Session Deletion --- 
+class DeleteResponse(BaseModel):
+    """Response model for session deletion confirmation."""
+    session_id: str
+    message: str 
