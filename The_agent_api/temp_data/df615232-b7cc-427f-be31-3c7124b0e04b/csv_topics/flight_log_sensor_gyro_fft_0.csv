@@ -1,5 +1,0 @@
-timestamp,timestamp_sample,device_id,sensor_sample_rate_hz,resolution_hz,peak_frequencies_x[0],peak_frequencies_x[1],peak_frequencies_x[2],peak_frequencies_y[0],peak_frequencies_y[1],peak_frequencies_y[2],peak_frequencies_z[0],peak_frequencies_z[1],peak_frequencies_z[2],peak_snr_x[0],peak_snr_x[1],peak_snr_x[2],peak_snr_y[0],peak_snr_y[1],peak_snr_y[2],peak_snr_z[0],peak_snr_z[1],peak_snr_z[2]
-777860000,777856000,1310988,250.0,0.48828125,123.50111,nan,nan,nan,nan,nan,nan,nan,nan,7.0068307,nan,nan,0.0,0.0,0.0,0.0,0.0,0.0
-870532000,870528000,1310988,250.0,0.48828125,123.4942,nan,nan,nan,nan,nan,nan,nan,nan,10.027239,nan,nan,0.0,0.0,0.0,0.0,0.0,0.0
-883844000,883840000,1310988,250.0,0.48828125,123.4942,nan,nan,nan,nan,nan,nan,nan,nan,10.035503,nan,nan,0.0,0.0,0.0,0.0,0.0,0.0
-898692000,898688000,1310988,250.0,0.48828125,123.4942,nan,nan,nan,nan,nan,nan,nan,nan,6.5905304,nan,nan,0.0,0.0,0.0,0.0,0.0,0.0

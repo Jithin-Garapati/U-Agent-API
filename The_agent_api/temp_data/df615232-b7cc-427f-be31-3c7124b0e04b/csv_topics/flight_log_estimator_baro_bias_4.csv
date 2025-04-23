@@ -1,2 +1,0 @@
-timestamp,timestamp_sample,baro_device_id,bias,bias_var,innov,innov_var,innov_test_ratio
-824236000,824126666,6620172,-0.05743363,0.004557349,-0.024667136,13.254559,5.1006987e-06

@@ -30,9 +30,13 @@ from typing import Dict, List, Tuple, Any, Optional
 from difflib import SequenceMatcher
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import collections
 
 class DynamicParameterTool:
     """Tool for extracting and querying dynamic parameters from flight logs."""
+    
+    # Define motor-related synonyms
+    MOTOR_SYNS = {"motor", "throttle", "esc", "actuator"}
     
     def __init__(self, csv_dir: str, kb_file: str = "formatted_knowledge_base.json"):
         """
@@ -53,72 +57,78 @@ class DynamicParameterTool:
     def _build_knowledge_base(self):
         """Build the internal knowledge base from KB file and CSV files."""
         print("Building knowledge base from csv_topics and formatted_knowledge_base.json...")
-        
-        # Load the formatted knowledge base
+
+        # Load the formatted knowledge base (contains predefined topics)
         formatted_kb = self._load_formatted_knowledge_base(self.kb_file)
-        
-        # Get CSV topics (filenames without extension)
-        csv_topics = self._extract_csv_topics()
-        
-        # Map CSV filenames to topics for easier lookup
-        topic_to_files = self._get_csv_topic_to_files_mapping()
-        
-        # Map CSV topics to KB entries
-        topic_to_kb, topic_to_confidence, topic_to_method = self._map_csv_topics_to_kb(
-            csv_topics, topic_to_files, formatted_kb
+
+        # Get mapping of raw CSV topic names to their corresponding filenames
+        topic_to_files = self._get_csv_topic_to_files_mapping() # e.g., {'vehicle_status': ['...status_0.csv'], 'vehicle_status_flags': ['...flags_0.csv']}
+        csv_topics_found = list(topic_to_files.keys())
+        print(f"Found {len(csv_topics_found)} unique raw topics in {self.csv_dir}")
+
+        # --- REVISED MAPPING ---
+        # Map CSV topics to KB entries STRICTLY (prefer exact match)
+        # Returns: kb_key_to_best_csv_topic, kb_key_to_confidence, kb_key_to_method, unmapped_csv_topics
+        kb_key_to_best_csv_topic, kb_key_to_confidence, kb_key_to_method, unmapped_csv_topics = self._map_csv_topics_to_kb_strict(
+            csv_topics_found, topic_to_files, formatted_kb
         )
-        
+        print(f"Mapped {len(kb_key_to_best_csv_topic)} KB keys to specific CSV topics.")
+        print(f"{len(unmapped_csv_topics)} CSV topics remain unmapped (will be loaded dynamically).")
+        # --- END REVISED MAPPING ---
+
         # Construct the knowledge base
         kb = {}
-        
-        # First, include entries from the formatted KB that have matching CSV files
-        for csv_topic, kb_key in topic_to_kb.items():
-            # Get the KB entry
+
+        # First, include entries from the formatted KB using the strict mapping
+        for kb_key, csv_topic in kb_key_to_best_csv_topic.items():
             if kb_key in formatted_kb:
                 kb_entry = formatted_kb[kb_key].copy()
-                
-                # Mark the source
-                kb_entry['source'] = 'combined'
-                
-                # Add file paths if available
+                kb_entry['source'] = 'combined' # Mark as combined source
+
+                # Add file paths using the uniquely mapped CSV topic
                 if csv_topic in topic_to_files:
-                    # Get all file paths for this topic
                     file_paths = [os.path.join(self.csv_dir, f) for f in topic_to_files[csv_topic]]
-                    # Use the first file path as the primary one
-                    kb_entry['file_path'] = file_paths[0]
-                    # Store all file paths
-                    kb_entry['all_file_paths'] = file_paths
-                    
-                    # ENHANCEMENT: Extract actual fields from CSV file instead of relying on KB
-                    # This ensures we have all fields including ones not in the knowledge base
-                    self._update_fields_from_csv(kb_entry, file_paths[0])
-                
-                # Add to knowledge base
+                    if file_paths:
+                         # Select primary based *only* on files for this specific topic
+                         primary_path = self._select_primary_file_simple(csv_topic, file_paths)
+                         if primary_path:
+                              kb_entry['file_path'] = primary_path
+                              kb_entry['all_file_paths'] = file_paths
+                              # Update fields ONLY from the primary file of the BEST matching CSV topic
+                              self._update_fields_from_csv(kb_entry, primary_path)
+                         else:
+                              print(f"Warning: Could not select primary file for mapped CSV topic {csv_topic} for KB key {kb_key}")
+                    else:
+                         print(f"Warning: No files found for mapped CSV topic {csv_topic} for KB key {kb_key}")
+                else:
+                     print(f"Warning: CSV topic {csv_topic} mapped to KB key {kb_key} not found in topic_to_files")
+
+                # Add the populated entry to the knowledge base
                 kb[kb_key] = kb_entry
-        
-        # Now load all dynamic topics that were not matched to KB entries
-        dynamic_topics = self._load_dynamic_topics()
-        
-        for topic, topic_info in dynamic_topics.items():
-            # Skip topics already included from formatted KB
-            if any(kb[k].get('name', '').lower() == topic.lower() for k in kb):
-                continue
-                
-            # Include only if it has a valid file path
+            else:
+                 print(f"Warning: KB key {kb_key} from mapping not found in formatted_kb")
+
+
+        # Now load dynamic topics from the list of UNMAPPED CSV topics
+        dynamic_topics_data = self._load_dynamic_topics(unmapped_csv_topics, topic_to_files)
+
+        # Add dynamic topics to the knowledge base, ensuring no key collision
+        for topic, topic_info in dynamic_topics_data.items():
+            # Generate a unique key for dynamic topics
+            dynamic_key = f"dynamic_{topic}"
+            if dynamic_key in kb:
+                 print(f"Warning: Dynamic key collision for {dynamic_key}. Skipping.")
+                 continue
             if 'file_path' in topic_info and os.path.exists(topic_info['file_path']):
-                # Generate a unique key
-                key = f"dynamic_{topic}"
-                kb[key] = topic_info
-        
-        # Filter the final knowledge base to only include entries with valid file paths
-        final_kb = {}
-        for key, entry in kb.items():
-            if 'file_path' in entry and os.path.exists(entry['file_path']):
-                final_kb[key] = entry
-        
-        self.knowledge_base = final_kb
+                 kb[dynamic_key] = topic_info
+            else:
+                 print(f"Warning: Dynamic topic {topic} lacks a valid file path. Skipping.")
+
+
+        # Final KB is built
+        self.knowledge_base = kb # Directly use the built kb
         print(f"Built knowledge base with {len(self.knowledge_base)} entries")
-        
+
         return self.knowledge_base
     
     def _load_formatted_knowledge_base(self, kb_filepath: str) -> Dict[str, Any]:
@@ -130,85 +140,43 @@ class DynamicParameterTool:
             print(f"Error loading formatted knowledge base: {e}")
             return {}
     
-    def _extract_csv_topics(self) -> List[str]:
-        """Extract CSV topic names from flight log directory."""
-        csv_topics = []
-        try:
-            for filename in os.listdir(self.csv_dir):
-                if filename.endswith('.csv'):
-                    # Extract the true topic name, handling the "flight_log_" prefix
-                    if filename.startswith("flight_log_"):
-                        # Remove 'flight_log_' prefix
-                        name_parts = filename[11:].split('_')
-                        
-                        # Remove numeric suffix if present
-                        if name_parts and name_parts[-1].split('.')[0].isdigit():
-                            topic_name = '_'.join(name_parts[:-1])
-                        else:
-                            topic_name = '_'.join(name_parts).split('.')[0]
-                    else:
-                        # Handle normal CSV files without prefix
-                        name_parts = filename.split('_')
-                        if name_parts and name_parts[-1].split('.')[0].isdigit():
-                            topic_name = '_'.join(name_parts[:-1])
-                        else:
-                            topic_name = os.path.splitext(filename)[0]
-                    
-                    if topic_name not in csv_topics:
-                        csv_topics.append(topic_name)
-                    
-                    # Also add the full filename as a topic for direct matching
-                    full_topic = os.path.splitext(filename)[0]
-                    if full_topic != topic_name and full_topic not in csv_topics:
-                        csv_topics.append(full_topic)
-        except Exception as e:
-            print(f"Error extracting CSV topics: {e}")
-        
-        return csv_topics
-    
     def _get_csv_topic_to_files_mapping(self) -> Dict[str, List[str]]:
-        """Create a mapping of CSV topics to their filenames."""
-        topic_to_files = {}
-        
+        """Create a mapping of RAW CSV topics to their filenames."""
+        topic_to_files = collections.defaultdict(list)
         try:
             for filename in os.listdir(self.csv_dir):
-                if filename.endswith('.csv'):
-                    # Extract the true topic name, handling the "flight_log_" prefix
-                    if filename.startswith("flight_log_"):
-                        # Remove 'flight_log_' prefix
-                        name_parts = filename[11:].split('_')
-                        
-                        # Remove numeric suffix if present (e.g., "_0" in "flight_log_topic_0.csv")
-                        if name_parts and name_parts[-1].split('.')[0].isdigit():
-                            topic_name = '_'.join(name_parts[:-1])
-                        else:
-                            topic_name = '_'.join(name_parts).split('.')[0]
-                    else:
-                        # Handle normal CSV files without prefix
-                        name_parts = filename.split('_')
-                        if name_parts and name_parts[-1].split('.')[0].isdigit():
-                            topic_name = '_'.join(name_parts[:-1])
-                        else:
-                            topic_name = os.path.splitext(filename)[0]
-                    
-                    if topic_name not in topic_to_files:
-                        topic_to_files[topic_name] = []
-                    
-                    topic_to_files[topic_name].append(filename)
-                    
-                    # Also add the full filename as a topic key for direct matching
-                    full_topic = os.path.splitext(filename)[0]
-                    if full_topic != topic_name and full_topic not in topic_to_files:
-                        topic_to_files[full_topic] = [filename]
-                        
-            # Print a debug message to show all extracted topics
-            print(f"Found {len(topic_to_files)} topics in {self.csv_dir}")
-            
+                 if filename.endswith('.csv'):
+                     topic_name = self._parse_topic_from_filename(filename)
+                     if topic_name:
+                          topic_to_files[topic_name].append(filename)
         except Exception as e:
-            print(f"Error mapping CSV topics to files: {e}")
+            print(f"Error building CSV topic-to-file mapping: {e}")
+        # Sort file lists for consistency
+        for topic in topic_to_files:
+            topic_to_files[topic].sort()
+        return dict(topic_to_files)
+
+    def _parse_topic_from_filename(self, filename: str) -> Optional[str]:
+        # Extract the true topic name, handling the "flight_log_" prefix
+        if filename.startswith("flight_log_"):
+            # Remove 'flight_log_' prefix
+            name_parts = filename[11:].split('_')
+            
+            # Remove numeric suffix if present
+            if name_parts and name_parts[-1].split('.')[0].isdigit():
+                topic_name = '_'.join(name_parts[:-1])
+            else:
+                topic_name = '_'.join(name_parts).split('.')[0]
+        else:
+            # Handle normal CSV files without prefix
+            name_parts = filename.split('_')
+            if name_parts and name_parts[-1].split('.')[0].isdigit():
+                topic_name = '_'.join(name_parts[:-1])
+            else:
+                topic_name = os.path.splitext(filename)[0]
         
-        return topic_to_files
-    
+        return topic_name
+
     def _string_similarity(self, a: str, b: str) -> float:
         """Calculate string similarity ratio between two strings."""
         return SequenceMatcher(None, a.lower(), b.lower()).ratio()
@@ -285,105 +253,149 @@ class DynamicParameterTool:
         
         return None
     
-    def _map_csv_topics_to_kb(self, csv_topics: List[str], topic_to_files: Dict[str, List[str]], kb: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, str]]:
-        """Map CSV topics to knowledge base entries using multiple strategies."""
-        topic_to_kb = {}
-        topic_to_confidence = {}
-        topic_to_method = {}
-        
-        # First pass: Try exact name matching
-        for topic in csv_topics:
-            kb_key, confidence = self._find_best_match(topic, kb)
-            if kb_key:
-                topic_to_kb[topic] = kb_key
-                topic_to_confidence[topic] = confidence
-                topic_to_method[topic] = 'name_matching'
-        
-        # Second pass: For unmatched topics, try field matching
-        for topic in csv_topics:
-            if topic in topic_to_kb:
-                continue
-                
-            if topic in topic_to_files and topic_to_files[topic]:
-                result = self._analyze_csv_header_fields(topic_to_files[topic][0], kb)
-                if result:
-                    kb_key, kb_name, confidence, common_fields = result
-                    topic_to_kb[topic] = kb_key
-                    topic_to_confidence[topic] = confidence
-                    topic_to_method[topic] = f'field_matching_{common_fields}'
-        
-        return topic_to_kb, topic_to_confidence, topic_to_method
+    def _map_csv_topics_to_kb_strict(self,
+                                     csv_topics: List[str],
+                                     topic_to_files: Dict[str, List[str]],
+                                     kb: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, str], List[str]]:
+        """
+        Strictly map CSV topics to knowledge base entries.
+        Ensures each KB key maps to at most ONE csv_topic. Prioritizes exact matches.
+
+        Returns:
+            kb_key_to_best_csv_topic: Mapping from KB key to the best matching CSV topic name.
+            kb_key_to_confidence: Confidence score for each mapping.
+            kb_key_to_method: Method used for each mapping ('exact', 'similarity', 'header').
+            unmapped_csv_topics: List of CSV topics that couldn't be mapped confidently.
+        """
+        kb_key_to_best_csv_topic = {}
+        kb_key_to_confidence = {}
+        kb_key_to_method = {}
+        mapped_csv_topics = set()
+
+        # --- Pass 1: Exact Name Matching ---
+        print("Mapping KB Keys: Pass 1 (Exact Name Match)")
+        kb_names_to_keys = {details.get('name', '').lower(): key for key, details in kb.items() if details.get('name')}
+        for csv_topic in csv_topics:
+            csv_topic_lower = csv_topic.lower()
+            if csv_topic_lower in kb_names_to_keys:
+                kb_key = kb_names_to_keys[csv_topic_lower]
+                # Check if this KB key is already mapped better
+                if kb_key not in kb_key_to_best_csv_topic or kb_key_to_confidence[kb_key] < 1.0:
+                     kb_key_to_best_csv_topic[kb_key] = csv_topic
+                     kb_key_to_confidence[kb_key] = 1.0
+                     kb_key_to_method[kb_key] = 'exact'
+                     mapped_csv_topics.add(csv_topic)
+                     # print(f"  Exact match: CSV '{csv_topic}' -> KB Key '{kb_key}'")
+
+
+        # --- Pass 2: Similarity / Header Analysis (Optional, High Threshold) ---
+        # Only consider topics not yet mapped
+        remaining_csv_topics = [t for t in csv_topics if t not in mapped_csv_topics]
+        # Only consider KB keys not yet mapped exactly
+        remaining_kb_keys = [k for k in kb.keys() if k not in kb_key_to_best_csv_topic]
+
+        print(f"Mapping KB Keys: Pass 2 (Similarity/Header on {len(remaining_csv_topics)} topics, {len(remaining_kb_keys)} keys)")
+        SIMILARITY_THRESHOLD = 0.9 # Example high threshold
+        HEADER_CONFIDENCE_THRESHOLD = 0.8 # Example high threshold
+
+        # Store potential matches temporarily to pick the best one per KB key later
+        potential_matches = collections.defaultdict(list) # kb_key -> list of (confidence, method, csv_topic)
+
+        for csv_topic in remaining_csv_topics:
+            # Similarity check against remaining KB entries
+            best_sim_kb_key, best_sim_score = self._find_best_match(csv_topic, {k: kb[k] for k in remaining_kb_keys})
+            if best_sim_kb_key and best_sim_score >= SIMILARITY_THRESHOLD:
+                 potential_matches[best_sim_kb_key].append((best_sim_score, 'similarity', csv_topic))
+                 # print(f"  Potential similarity match: CSV '{csv_topic}' -> KB Key '{best_sim_kb_key}' (Score: {best_sim_score:.2f})")
+
+            # Header analysis check against remaining KB entries
+            files_for_topic = topic_to_files.get(csv_topic, [])
+            if files_for_topic:
+                 primary_file_for_topic = self._select_primary_file_simple(csv_topic, [os.path.join(self.csv_dir, f) for f in files_for_topic])
+                 if primary_file_for_topic:
+                      header_match_result = self._analyze_csv_header_fields(primary_file_for_topic, {k: kb[k] for k in remaining_kb_keys})
+                      if header_match_result:
+                           header_kb_key, _, header_confidence, _ = header_match_result
+                           if header_confidence >= HEADER_CONFIDENCE_THRESHOLD:
+                                potential_matches[header_kb_key].append((header_confidence, 'header', csv_topic))
+                                # print(f"  Potential header match: CSV '{csv_topic}' -> KB Key '{header_kb_key}' (Score: {header_confidence:.2f})")
+
+
+        # Resolve potential matches: pick the best match for each remaining KB key
+        for kb_key in remaining_kb_keys:
+             if kb_key in potential_matches:
+                  # Sort matches by confidence descending, method preference (header > similarity?)
+                  # For simplicity, just take highest confidence
+                  potential_matches[kb_key].sort(key=lambda x: x[0], reverse=True)
+                  best_confidence, best_method, best_csv_topic = potential_matches[kb_key][0]
+
+                  # Ensure this CSV topic hasn't been mapped exactly already
+                  if best_csv_topic not in mapped_csv_topics:
+                       # Check if another CSV topic already non-exactly mapped to this kb_key with higher confidence
+                       if kb_key not in kb_key_to_best_csv_topic or best_confidence > kb_key_to_confidence[kb_key]:
+                            # If another csv mapped non-exactly previously, mark it as unmapped now
+                            if kb_key in kb_key_to_best_csv_topic:
+                                 old_csv_topic = kb_key_to_best_csv_topic[kb_key]
+                                 if old_csv_topic not in mapped_csv_topics: # Check it wasn't an exact match originally
+                                      pass # It will be added to unmapped later
+                            
+                            kb_key_to_best_csv_topic[kb_key] = best_csv_topic
+                            kb_key_to_confidence[kb_key] = best_confidence
+                            kb_key_to_method[kb_key] = best_method
+                            mapped_csv_topics.add(best_csv_topic) # Mark this csv topic as mapped
+                            # print(f"  Selected non-exact match: CSV '{best_csv_topic}' -> KB Key '{kb_key}' (Score: {best_confidence:.2f}, Method: {best_method})")
+
+
+        # Final list of unmapped topics
+        final_unmapped_csv_topics = [t for t in csv_topics if t not in mapped_csv_topics]
+
+        return kb_key_to_best_csv_topic, kb_key_to_confidence, kb_key_to_method, final_unmapped_csv_topics
     
-    def _load_dynamic_topics(self) -> Dict[str, Dict[str, Any]]:
-        """Load dynamic topics from CSV files in the flight log directory."""
-        topics = {}
-        
-        try:
-            for filename in os.listdir(self.csv_dir):
-                if filename.endswith('.csv'):
-                    file_path = os.path.join(self.csv_dir, filename)
-                    
-                    # Extract the true topic name, handling the "flight_log_" prefix
-                    if filename.startswith("flight_log_"):
-                        # Remove 'flight_log_' prefix
-                        name_parts = filename[11:].split('_')
-                        
-                        # Remove numeric suffix if present
-                        if name_parts and name_parts[-1].split('.')[0].isdigit():
-                            topic_name = '_'.join(name_parts[:-1])
-                        else:
-                            topic_name = '_'.join(name_parts).split('.')[0]
-                    else:
-                        # Handle normal CSV files without prefix
-                        name_parts = filename.split('_')
-                        if name_parts and name_parts[-1].split('.')[0].isdigit():
-                            topic_name = '_'.join(name_parts[:-1])
-                        else:
-                            topic_name = os.path.splitext(filename)[0]
-                    
-                    # Create or update topic info
-                    if topic_name not in topics:
-                        topics[topic_name] = {
-                            'name': topic_name,
-                            'description': f"Dynamic data from {topic_name}",
-                            'source': 'dynamic',
-                            'file_path': file_path,
-                            'all_file_paths': [file_path],
-                            'fields': {}
-                        }
-                    else:
-                        # Add this file to the list if not already there
-                        if file_path not in topics[topic_name]['all_file_paths']:
-                            topics[topic_name]['all_file_paths'].append(file_path)
-                    
-                    # Try to extract fields and row count
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            reader = csv.reader(f)
-                            headers = next(reader, [])
-                            
-                            # Count lines (up to 1000 for performance)
-                            line_count = 0
-                            for _ in reader:
-                                line_count += 1
-                                if line_count >= 1000:
-                                    line_count = ">1000"
-                                    break
-                            
-                            topics[topic_name]['line_count'] = line_count
-                            
-                            # Create basic field info for all headers
-                            for header in headers:
-                                if header not in topics[topic_name]['fields']:
-                                    topics[topic_name]['fields'][header] = {
-                                        'description': f"Field {header} in {topic_name}"
-                                    }
-                    except Exception as e:
-                        print(f"Error reading CSV file {filename}: {e}")
-        except Exception as e:
-            print(f"Error loading dynamic topics: {e}")
-        
-        return topics
+    def _select_primary_file_simple(self, topic: str, file_paths: List[str]) -> Optional[str]:
+        """Select the primary file path - simply take the first one for now."""
+        # ToDO: Implement more robust selection if needed (e.g., prefer _0 suffix)
+        if not file_paths:
+             return None
+        # Simple: return the first path in the list (assuming lists are sorted)
+        return file_paths[0]
+    
+    def _load_dynamic_topics(self,
+                             dynamic_csv_topics: List[str],
+                             topic_to_files: Dict[str, List[str]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Load topics directly from CSV files for topics that were *not* mapped to the formatted KB.
+        Args:
+            dynamic_csv_topics: List of raw CSV topic names confirmed to be unmapped.
+            topic_to_files: Mapping of raw topic names to filenames.
+        """
+        dynamic_topics = {}
+        print(f"Loading {len(dynamic_csv_topics)} topics dynamically...")
+
+        for topic in dynamic_csv_topics:
+            if topic not in topic_to_files:
+                print(f"Warning: Unmapped topic '{topic}' not found in topic_to_files. Skipping dynamic load.")
+                continue
+
+            files = topic_to_files[topic]
+            all_paths = [os.path.join(self.csv_dir, f) for f in files]
+            primary_path = self._select_primary_file_simple(topic, all_paths) # Use consistent selection
+
+            if primary_path and os.path.exists(primary_path):
+                topic_info = {
+                    'name': topic, # Use the raw topic name
+                    'description': f'Dynamically loaded data for {topic}', # Basic description
+                    'fields': {}, # Placeholder, filled by _update_fields_from_csv
+                    'file_path': primary_path,
+                    'all_file_paths': all_paths,
+                    'source': 'dynamic_csv'
+                }
+                # Extract fields from the primary CSV
+                self._update_fields_from_csv(topic_info, primary_path)
+                dynamic_topics[topic] = topic_info # Use topic name as key for dynamic entries
+            else:
+                print(f"Warning: No valid primary file found for dynamic topic '{topic}'. Skipping.")
+
+        return dynamic_topics
     
     def _update_fields_from_csv(self, kb_entry: Dict[str, Any], csv_file_path: str) -> None:
         """
@@ -499,16 +511,27 @@ class DynamicParameterTool:
         return found_keywords if found_keywords else ['general']
     
     def _retrieve_candidates(self, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """Retrieve and rank candidate parameters/topics for a given query."""
+        """Retrieve candidate entries from knowledge base using semantic search and boosting."""
+        
+        query_keywords = self._extract_query_keywords(query)
+        
+        # --- Motor Query Augmentation ---
+        is_motor_query = bool(self.MOTOR_SYNS.intersection(query_keywords))
+        augmented_query = query # Start with original query
+        augmentation_applied_log = False # For logging within this method
+        if is_motor_query:
+            print(f"MOTOR_QUERY_LOG: Motor query detected (keywords: {self.MOTOR_SYNS.intersection(query_keywords)}). Augmenting query.")
+            augmented_query += " actuator_outputs"
+            augmentation_applied_log = True
+            # NOTE: Omitted disable_parent_topic_boost() as it doesn't map clearly.
+        # --- End Motor Query Augmentation ---
+
+        # Generate query embedding using potentially augmented query
+        query_embedding = self.model.encode([augmented_query])
+        
+        # Ensure knowledge base is built
         if not self.knowledge_base:
-            print("Knowledge base not initialized. Call _build_knowledge_base() first.")
-            return []
-        
-        # Encode the query
-        query_embedding = self.model.encode(query.strip())
-        
-        # Extract query keywords for boosting
-        query_keywords = self._extract_query_keywords(query.lower())
+            self._build_knowledge_base()
         
         # Calculate cosine similarity
         def cosine_similarity(vec1, vec2):
@@ -662,15 +685,20 @@ class DynamicParameterTool:
         
         # Sort by score descending and return top-k
         sorted_candidates = sorted(candidate_scores, key=lambda x: x[1], reverse=True)
+        
+        # Log if augmentation was applied in this specific call
+        if augmentation_applied_log:
+             print(f"VISIBILITY_METRIC_LOG: Initial query augmented with 'actuator_outputs' for query: '{query}'")
+
         return sorted_candidates[:top_k]
     
-    def query(self, query_text: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def query(self, query_text: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         Query the dynamic parameters using natural language.
         
         Args:
             query_text: The natural language query (e.g., "What was the maximum speed?")
-            top_k: Number of top results to return
+            top_k: Number of top results to return (default 10)
             
         Returns:
             List of dictionaries containing parameter information
@@ -678,12 +706,34 @@ class DynamicParameterTool:
         if not self.knowledge_base:
             self._build_knowledge_base()
         
-        # Get top candidates
-        candidates = self._retrieve_candidates(query_text, top_k * 2)  # Get more candidates to filter
+        # Get initial top candidates (fetch more to allow filtering)
+        initial_candidates = self._retrieve_candidates(query_text, top_k * 2)
+
+        # --- Auto-fallback logic ---
+        final_candidates = initial_candidates # Assume initial results are used unless fallback happens
+        scores = [score for _, score in initial_candidates]
         
-        # Format results
+        # Check if original query would have been augmented
+        query_keywords_for_fallback = self._extract_query_keywords(query_text)
+        is_motor_query_for_fallback = bool(self.MOTOR_SYNS.intersection(query_keywords_for_fallback))
+        original_query_was_motor_augmented = is_motor_query_for_fallback 
+
+        # Check if fallback is needed: 
+        # 1. No candidates OR max score is low (< 0.4)
+        # 2. AND the original query was NOT already augmented due to motor keywords
+        if (not initial_candidates or (scores and max(scores) < 0.4)) and not original_query_was_motor_augmented:
+             print(f"FALLBACK_LOG: Initial results poor (max score < 0.4 or none) and motor augmentation not initially applied. Auto-retrying with '+ actuator_outputs'.")
+             fallback_query = query_text + " actuator_outputs"
+             # Re-run candidate retrieval with the explicitly augmented query
+             # Use original top_k * 2 for consistency
+             final_candidates = self._retrieve_candidates(fallback_query, top_k * 2)
+             # Log metric: Note that fallback happened
+             print(f"VISIBILITY_METRIC_LOG: Fallback augmentation triggered for query: '{query_text}'")
+        # --- End Auto-fallback logic ---
+
+        # Format results using the final candidate list (either initial or fallback)
         results = []
-        for key, score in candidates:
+        for key, score in final_candidates:
             if key in self.knowledge_base:
                 entry = self.knowledge_base[key]
                 
